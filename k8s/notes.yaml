@@ -1,0 +1,103 @@
+# The stateful half of the lab: a notes API whose data lives in SQLite on a PersistentVolume.
+apiVersion: v1
+kind: Service
+metadata:
+  name: notes
+  namespace: drlab
+spec:
+  selector:
+    app: notes
+  ports:
+    - port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: notes
+  namespace: drlab
+spec:
+  serviceName: notes
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notes
+  template:
+    metadata:
+      labels:
+        app: notes
+      annotations:
+        # Velero: back up the "data" volume's contents (file-system backup), and first flush SQLite's WAL
+        # so the copy is consistent (an application-consistent backup, not just a crash-consistent one).
+        backup.velero.io/backup-volumes: data
+        pre.hook.backup.velero.io/container: notes
+        pre.hook.backup.velero.io/command: '["python","/app/app.py","--checkpoint"]'
+        pre.hook.backup.velero.io/on-error: Fail
+        pre.hook.backup.velero.io/timeout: 30s
+    spec:
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: notes
+          image: drlab-app:1
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: MODE, value: stateful }
+            - { name: DATA_DIR, value: /data }
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+          ports:
+            - { name: http, containerPort: 8080 }
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: notes
+  namespace: drlab
+spec:
+  rules:
+    - host: notes.drlab.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: notes
+                port: { number: 8080 }
